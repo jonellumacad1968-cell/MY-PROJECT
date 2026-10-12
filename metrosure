@@ -1,0 +1,749 @@
+#include <LovyanGFX.hpp>
+
+// ==========================================
+// --- Enums & Data Structures (Declared Early) ---
+// ==========================================
+enum AppView { VIEW_LOGIN, VIEW_MATERIAL_DASHBOARD, VIEW_METROSURE };
+enum UnitMode { UNIT_MM, UNIT_CM, UNIT_M, UNIT_INCH };
+enum SystemState { STATE_STOPPED, STATE_RUNNING, STATE_PAUSED };
+
+struct MaterialItem {
+  const char* name;
+  float std_bar_length_mm;    // Standard length per piece (e.g. 6000mm = 6m)
+  uint32_t total_bars_left;   // Remaining count of full pieces
+  float total_length_left_mm; // Remaining total length (mm)
+  float total_length_cut_mm;  // Accumulated length cut (mm)
+};
+
+// ==========================================
+// --- Forward Declarations ---
+// ==========================================
+float convertFromMM(float mm, UnitMode u);
+float convertToMM(float val, UnitMode u);
+const char* getUnitStr(UnitMode u);
+void drawFullUI();
+
+// ==========================================
+// --- Hardware Setup ---
+// ==========================================
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7796  _panel_instance; 
+  lgfx::Bus_SPI       _bus_instance;
+  lgfx::Touch_FT5x06  _touch_instance;
+
+public:
+  LGFX() {
+    { // SPI Bus Config
+      auto cfg = _bus_instance.config();
+      cfg.spi_host = SPI2_HOST;
+      cfg.spi_mode = 0;
+      cfg.freq_write = 27000000;
+      cfg.pin_sclk = 12;
+      cfg.pin_mosi = 11;
+      cfg.pin_miso = -1;
+      cfg.pin_dc   = 8;
+      _bus_instance.config(cfg);
+      _panel_instance.setBus(&_bus_instance);
+    }
+
+    { // Panel Config
+      auto cfg = _panel_instance.config();
+      cfg.pin_cs           = 10;
+      cfg.pin_rst          = 9;
+      cfg.pin_busy         = -1;
+      cfg.panel_width      = 320;
+      cfg.panel_height     = 480;
+      cfg.offset_x         = 0;
+      cfg.offset_y         = 0;
+      cfg.invert           = true;
+      _panel_instance.config(cfg);
+    }
+
+    { // Touch Config
+      auto cfg = _touch_instance.config();
+      cfg.x_min      = 0;
+      cfg.x_max      = 319;
+      cfg.y_min      = 0;
+      cfg.y_max      = 479;
+      cfg.pin_int    = 3;
+      cfg.pin_rst    = 4;
+      cfg.bus_shared = false;
+      cfg.i2c_port   = 0;
+      cfg.pin_scl    = 2;
+      cfg.pin_sda    = 1;
+      cfg.freq       = 400000;
+      cfg.i2c_addr   = 0x38;
+      _touch_instance.config(cfg);
+      _panel_instance.setTouch(&_touch_instance);
+    }
+
+    setPanel(&_panel_instance);
+  }
+};
+
+LGFX lcd;
+
+// ==========================================
+// --- Rotary Encoder Pins & Calibration ---
+// ==========================================
+#define ENCODER_PIN_A 6
+#define ENCODER_PIN_B 5
+
+const float MM_PER_PULSE = 0.10f; 
+
+volatile long encoder_pulse_count = 0;
+float prev_drawn_encoder_mm = -1.0f;
+
+void IRAM_ATTR readEncoderISR() {
+  int valB = digitalRead(ENCODER_PIN_B);
+  if (valB > 0) {
+    encoder_pulse_count++;
+  } else {
+    encoder_pulse_count--;
+  }
+}
+
+// ==========================================
+// --- Unified Color Theme ---
+// ==========================================
+#define COLOR_BG        0x10A2  
+#define COLOR_CARD_BG   0x18C5  
+#define COLOR_HEADER    0x2104  
+
+#define COLOR_BTN_BG    0x2A0D  
+#define COLOR_LINE      0x7BEF  
+#define COLOR_TEXT      0xFFFF  
+#define COLOR_ACTIVE    0x001F  
+
+// ==========================================
+// --- Navigation States & Global Data ---
+// ==========================================
+AppView current_view = VIEW_LOGIN;
+
+String input_pin = "";
+const String VALID_PIN = "1234";
+
+MaterialItem materials[] = {
+  {"Steel Pipe 50mm",    6000.0f, 10, 60000.0f, 0.0f},
+  {"Aluminum Bar 20mm", 6000.0f,  8, 48000.0f, 0.0f},
+  {"Copper Tube 12mm",  3000.0f, 15, 45000.0f, 0.0f},
+  {"PVC Conduit 25mm",  3000.0f, 20, 60000.0f, 0.0f}
+};
+const int TOTAL_MATERIALS = 4;
+int selected_material_idx = 0;
+
+UnitMode current_unit = UNIT_MM;
+SystemState system_state = STATE_STOPPED;
+
+float raw_target_mm = 0.00;
+float raw_encoder_mm = 0.00;
+uint32_t piece_count = 0; 
+
+bool showing_keypad = false;
+bool showing_finish_modal = false;
+String keypad_input = "";
+
+unsigned long last_touch_time = 0;
+const unsigned long TOUCH_DEBOUNCE_MS = 150;
+
+// ==========================================
+// --- Conversion Helpers ---
+// ==========================================
+float convertFromMM(float mm, UnitMode u) {
+  switch (u) {
+    case UNIT_CM:   return mm / 10.0f;
+    case UNIT_M:    return mm / 1000.0f;
+    case UNIT_INCH: return mm / 25.4f;
+    default:        return mm;
+  }
+}
+
+float convertToMM(float val, UnitMode u) {
+  switch (u) {
+    case UNIT_CM:   return val * 10.0f;
+    case UNIT_M:    return val * 1000.0f;
+    case UNIT_INCH: return val * 25.4f;
+    default:        return val;
+  }
+}
+
+const char* getUnitStr(UnitMode u) {
+  switch (u) {
+    case UNIT_CM:   return "cm";
+    case UNIT_M:    return "m";
+    case UNIT_INCH: return "in";
+    default:        return "mm";
+  }
+}
+
+// ==========================================
+// --- 1. LOGIN SCREEN ---
+// ==========================================
+void drawLoginScreen() {
+  lcd.startWrite();
+  lcd.fillScreen(COLOR_BG);
+
+  lcd.fillRect(0, 0, 480, 35, COLOR_HEADER);
+  lcd.drawFastHLine(0, 35, 480, COLOR_LINE);
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setTextSize(2);
+  lcd.setTextColor(COLOR_TEXT, COLOR_HEADER);
+  lcd.drawString("METROSURE LOGIN", 240, 18);
+
+  lcd.fillRect(40, 50, 400, 55, COLOR_CARD_BG);
+  lcd.drawRect(40, 50, 400, 55, COLOR_LINE);
+
+  lcd.setTextDatum(TL_DATUM);
+  lcd.setTextSize(1);
+  lcd.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  lcd.drawString("ENTER EMPLOYEE PIN:", 50, 55);
+
+  String masked = "";
+  for (unsigned int i = 0; i < input_pin.length(); i++) masked += "*";
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setTextSize(3);
+  lcd.drawString(masked, 240, 85);
+
+  const char* keys[4][3] = {
+    {"1", "2", "3"},
+    {"4", "5", "6"},
+    {"7", "8", "9"},
+    {"CLR", "0", "LOGIN"}
+  };
+
+  int start_x = 110, start_y = 115, kw = 80, kh = 42, gap = 8;
+  for (int r = 0; r < 4; r++) {
+    for (int c = 0; c < 3; c++) {
+      int x = start_x + c * (kw + gap);
+      int y = start_y + r * (kh + gap);
+      lcd.fillRect(x, y, kw, kh, COLOR_BTN_BG);
+      lcd.drawRect(x, y, kw, kh, COLOR_LINE);
+      lcd.setTextSize(2);
+      lcd.setTextColor(COLOR_TEXT, COLOR_BTN_BG);
+      lcd.drawString(keys[r][c], x + kw / 2, y + kh / 2);
+    }
+  }
+  lcd.endWrite();
+}
+
+void handleLoginTouch(uint16_t x, uint16_t y) {
+  int start_x = 110, start_y = 115, kw = 80, kh = 42, gap = 8;
+
+  for (int r = 0; r < 4; r++) {
+    for (int c = 0; c < 3; c++) {
+      int kx = start_x + c * (kw + gap);
+      int ky = start_y + r * (kh + gap);
+
+      if (x >= kx && x <= (kx + kw) && y >= ky && y <= (ky + kh)) {
+        if (r == 3 && c == 0) {
+          input_pin = "";
+        } else if (r == 3 && c == 2) {
+          if (input_pin == VALID_PIN) {
+            input_pin = "";
+            current_view = VIEW_MATERIAL_DASHBOARD;
+            drawFullUI();
+          } else {
+            input_pin = "";
+            drawLoginScreen();
+          }
+          return;
+        } else {
+          if (input_pin.length() < 6) {
+            input_pin += (r == 3 && c == 1) ? "0" : String(r * 3 + c + 1);
+          }
+        }
+        drawLoginScreen();
+        return;
+      }
+    }
+  }
+}
+
+// ==========================================
+// --- 2. MATERIAL DASHBOARD ---
+// ==========================================
+void drawMaterialDashboard() {
+  lcd.startWrite();
+  lcd.fillScreen(COLOR_BG);
+
+  lcd.fillRect(0, 0, 480, 35, COLOR_HEADER);
+  lcd.drawFastHLine(0, 35, 480, COLOR_LINE);
+  lcd.setTextDatum(TL_DATUM);
+  lcd.setTextSize(2);
+  lcd.setTextColor(COLOR_TEXT, COLOR_HEADER);
+  lcd.drawString("SELECT MATERIAL STOCK", 10, 8);
+
+  // Logout Button
+  lcd.fillRect(380, 4, 90, 26, COLOR_BTN_BG);
+  lcd.drawRect(380, 4, 90, 26, COLOR_LINE);
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setTextSize(1);
+  lcd.drawString("LOGOUT", 425, 17);
+
+  int card_y = 42;
+  int card_h = 62;
+
+  for (int i = 0; i < TOTAL_MATERIALS; i++) {
+    lcd.fillRect(10, card_y, 460, card_h, COLOR_CARD_BG);
+    lcd.drawRect(10, card_y, 460, card_h, COLOR_LINE);
+
+    lcd.setTextDatum(TL_DATUM);
+    lcd.setTextSize(2);
+    lcd.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+    lcd.drawString(materials[i].name, 20, card_y + 6);
+
+    char buf1[64], buf2[64];
+    snprintf(buf1, sizeof(buf1), "Std Size: %.0fmm | Qty: %lu pcs", 
+             materials[i].std_bar_length_mm, (unsigned long)materials[i].total_bars_left);
+    snprintf(buf2, sizeof(buf2), "Total Left: %.1fm | Cut: %.1fm", 
+             materials[i].total_length_left_mm / 1000.0f, materials[i].total_length_cut_mm / 1000.0f);
+
+    lcd.setTextSize(1);
+    lcd.drawString(buf1, 20, card_y + 28);
+    lcd.drawString(buf2, 20, card_y + 44);
+
+    lcd.fillRect(350, card_y + 12, 110, 38, COLOR_BTN_BG);
+    lcd.drawRect(350, card_y + 12, 110, 38, COLOR_LINE);
+    lcd.setTextDatum(MC_DATUM);
+    lcd.setTextSize(2);
+    lcd.drawString("SELECT", 405, card_y + 31);
+
+    card_y += card_h + 6;
+  }
+  lcd.endWrite();
+}
+
+void handleMaterialTouch(uint16_t x, uint16_t y) {
+  if (x >= 380 && x <= 470 && y >= 4 && y <= 30) {
+    current_view = VIEW_LOGIN;
+    drawFullUI();
+    return;
+  }
+
+  int card_y = 42;
+  int card_h = 62;
+
+  for (int i = 0; i < TOTAL_MATERIALS; i++) {
+    if (y >= card_y && y <= (card_y + card_h)) {
+      selected_material_idx = i;
+      piece_count = 0;
+      current_view = VIEW_METROSURE;
+      drawFullUI();
+      return;
+    }
+    card_y += card_h + 6;
+  }
+}
+
+// ==========================================
+// --- 3. KEYPAD POPUP ---
+// ==========================================
+void updateKeypadDisplay() {
+  lcd.startWrite();
+  lcd.fillRect(21, 11, 438, 48, COLOR_CARD_BG);
+
+  lcd.setTextDatum(TL_DATUM);
+  lcd.setTextSize(1);
+  lcd.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  lcd.drawString("ENTER TARGET VALUE:", 30, 15);
+
+  lcd.setTextDatum(TR_DATUM);
+  lcd.setTextSize(3);
+  lcd.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  String disp = (keypad_input.length() == 0) ? "0" : keypad_input;
+  disp += " ";
+  disp += getUnitStr(current_unit);
+  lcd.drawString(disp, 450, 25);
+  lcd.endWrite();
+}
+
+void drawKeypad() {
+  lcd.startWrite();
+  lcd.fillScreen(COLOR_BG);
+
+  lcd.fillRect(20, 10, 440, 50, COLOR_CARD_BG);
+  lcd.drawRect(20, 10, 440, 50, COLOR_LINE);
+
+  const char* keys[4][3] = {
+    {"1", "2", "3"},
+    {"4", "5", "6"},
+    {"7", "8", "9"},
+    {".", "0", "CLR"}
+  };
+
+  int start_x = 40, start_y = 70, kw = 90, kh = 45, gap = 10;
+
+  for (int r = 0; r < 4; r++) {
+    for (int c = 0; c < 3; c++) {
+      int x = start_x + c * (kw + gap);
+      int y = start_y + r * (kh + gap);
+      
+      lcd.fillRect(x, y, kw, kh, COLOR_BTN_BG);
+      lcd.drawRect(x, y, kw, kh, COLOR_LINE);
+
+      lcd.setTextDatum(MC_DATUM);
+      lcd.setTextSize(2);
+      lcd.setTextColor(COLOR_TEXT, COLOR_BTN_BG);
+      lcd.drawString(keys[r][c], x + kw / 2, y + kh / 2);
+    }
+  }
+
+  lcd.fillRect(340, 70, 100, 100, COLOR_BTN_BG);
+  lcd.drawRect(340, 70, 100, 100, COLOR_LINE);
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setTextSize(2);
+  lcd.setTextColor(COLOR_TEXT, COLOR_BTN_BG);
+  lcd.drawString("OK", 390, 120);
+
+  lcd.fillRect(340, 185, 100, 105, COLOR_BTN_BG);
+  lcd.drawRect(340, 185, 100, 105, COLOR_LINE);
+  lcd.setTextColor(COLOR_TEXT, COLOR_BTN_BG);
+  lcd.drawString("CANCEL", 390, 237);
+
+  lcd.endWrite();
+  updateKeypadDisplay();
+}
+
+void handleKeypadTouch(uint16_t x, uint16_t y) {
+  int start_x = 40, start_y = 70, kw = 90, kh = 45, gap = 10;
+
+  for (int r = 0; r < 4; r++) {
+    for (int c = 0; c < 3; c++) {
+      int kx = start_x + c * (kw + gap);
+      int ky = start_y + r * (kh + gap);
+
+      if (x >= kx && x <= (kx + kw) && y >= ky && y <= (ky + kh)) {
+        if (r == 3 && c == 0) {
+          if (keypad_input.indexOf('.') == -1) {
+            if (keypad_input.length() == 0) keypad_input = "0";
+            keypad_input += ".";
+          }
+        } else if (r == 3 && c == 2) {
+          keypad_input = "";
+        } else {
+          if (keypad_input.length() < 8) {
+            keypad_input += (r == 3 && c == 1) ? "0" : String(r * 3 + c + 1);
+          }
+        }
+        updateKeypadDisplay();
+        return;
+      }
+    }
+  }
+
+  if (x >= 340 && x <= 440 && y >= 70 && y <= 170) {
+    if (keypad_input.length() > 0) {
+      float val = keypad_input.toFloat();
+      raw_target_mm = convertToMM(val, current_unit);
+    }
+    showing_keypad = false;
+    drawFullUI();
+  }
+
+  if (x >= 340 && x <= 440 && y >= 185 && y <= 290) {
+    showing_keypad = false;
+    drawFullUI();
+  }
+}
+
+// ==========================================
+// --- 4. METROSURE DASHBOARD COMPONENTS ---
+// ==========================================
+void drawUnitButtons() {
+  const char* units[] = {"MM", "CM", "M", "INCH"};
+  int btn_w = 40, btn_h = 24, start_x = 300, start_y = 35;
+
+  lcd.startWrite();
+  for (int i = 0; i < 4; i++) {
+    int x = start_x + (i * (btn_w + 2));
+    uint16_t bg = (current_unit == i) ? COLOR_ACTIVE : COLOR_BTN_BG;
+
+    lcd.fillRect(x, start_y, btn_w, btn_h, bg);
+    lcd.drawRect(x, start_y, btn_w, btn_h, COLOR_LINE);
+    
+    lcd.setTextSize(1);
+    lcd.setTextColor(COLOR_TEXT, bg);
+    lcd.setTextDatum(MC_DATUM);
+    lcd.drawString(units[i], x + (btn_w / 2), start_y + (btn_h / 2));
+  }
+  lcd.endWrite();
+}
+
+void drawTargetCard() {
+  lcd.startWrite();
+  lcd.fillRect(11, 66, 458, 58, COLOR_CARD_BG);
+  lcd.drawRect(10, 65, 460, 60, COLOR_LINE);
+
+  lcd.setTextDatum(TL_DATUM);
+  lcd.setTextSize(1);
+  lcd.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  
+  String title = "SET TARGET MEASURE (TAP TO CHANGE) - ";
+  title += materials[selected_material_idx].name;
+  lcd.drawString(title, 20, 71);
+
+  float target_val = convertFromMM(raw_target_mm, current_unit);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%.2f %s", target_val, getUnitStr(current_unit));
+
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setTextSize(3);
+  lcd.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  lcd.drawString(buf, 240, 102);
+  lcd.endWrite();
+}
+
+void drawEncoderCard() {
+  lcd.startWrite();
+  lcd.fillRect(11, 131, 238, 103, COLOR_CARD_BG);
+  lcd.drawRect(10, 130, 240, 105, COLOR_LINE);
+
+  lcd.setTextDatum(TL_DATUM);
+  lcd.setTextSize(1);
+  lcd.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  lcd.drawString("LIVE ENCODER READING", 20, 136);
+
+  float encoder_val = convertFromMM(raw_encoder_mm, current_unit);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%.2f %s", encoder_val, getUnitStr(current_unit));
+
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setTextSize(3);
+  lcd.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  lcd.drawString(buf, 130, 185);
+  lcd.endWrite();
+}
+
+void drawStockInfoCard() {
+  lcd.startWrite();
+  lcd.fillRect(256, 131, 213, 103, COLOR_CARD_BG);
+  lcd.drawRect(255, 130, 215, 105, COLOR_LINE);
+
+  MaterialItem &mat = materials[selected_material_idx];
+
+  lcd.setTextDatum(TL_DATUM);
+  lcd.setTextSize(1);
+  lcd.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  lcd.drawString("MATERIAL STOCK LEFT", 265, 136);
+
+  char buf1[32], buf2[32];
+  snprintf(buf1, sizeof(buf1), "Qty: %lu pcs", (unsigned long)mat.total_bars_left);
+  snprintf(buf2, sizeof(buf2), "Rem: %.2fm", mat.total_length_left_mm / 1000.0f);
+
+  lcd.setTextSize(2);
+  lcd.drawString(buf1, 265, 158);
+  lcd.drawString(buf2, 265, 185);
+  lcd.endWrite();
+}
+
+void drawActionButtons() {
+  lcd.startWrite();
+  lcd.fillRect(10, 242, 145, 68, COLOR_BTN_BG);
+  lcd.drawRect(10, 242, 145, 68, COLOR_LINE);
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setTextSize(2);
+  lcd.setTextColor(COLOR_TEXT, COLOR_BTN_BG);
+  lcd.drawString("START", 82, 276);
+
+  lcd.fillRect(167, 242, 145, 68, COLOR_BTN_BG);
+  lcd.drawRect(167, 242, 145, 68, COLOR_LINE);
+  lcd.setTextColor(COLOR_TEXT, COLOR_BTN_BG);
+  lcd.drawString("PAUSE", 240, 276);
+
+  lcd.fillRect(325, 242, 145, 68, COLOR_BTN_BG);
+  lcd.drawRect(325, 242, 145, 68, COLOR_LINE);
+  lcd.setTextColor(COLOR_TEXT, COLOR_BTN_BG);
+  lcd.drawString("RESET", 397, 276);
+  lcd.endWrite();
+}
+
+void drawFinishPopup() {
+  showing_finish_modal = true;
+  lcd.startWrite();
+  lcd.fillRect(60, 50, 360, 210, COLOR_CARD_BG);
+  lcd.drawRect(60, 50, 360, 210, COLOR_LINE);
+  lcd.drawRect(61, 51, 358, 208, COLOR_LINE);
+
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setTextSize(3);
+  lcd.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  lcd.drawString("CUT COMPLETED!", 240, 80);
+
+  lcd.setTextSize(2);
+  lcd.setTextColor(COLOR_TEXT, COLOR_CARD_BG);
+  lcd.drawString("STOCK DEDUCTED", 240, 115);
+
+  MaterialItem &mat = materials[selected_material_idx];
+  char buf[48];
+  snprintf(buf, sizeof(buf), "Stock Left: %.1fm (%lupcs)", 
+           mat.total_length_left_mm / 1000.0f, (unsigned long)mat.total_bars_left);
+  lcd.drawString(buf, 240, 150);
+
+  lcd.fillRect(160, 195, 160, 50, COLOR_BTN_BG);
+  lcd.drawRect(160, 195, 160, 50, COLOR_LINE);
+  lcd.setTextColor(COLOR_TEXT, COLOR_BTN_BG);
+  lcd.drawString("DISMISS", 240, 220);
+  lcd.endWrite();
+}
+
+void drawMetroSureDashboard() {
+  lcd.startWrite();
+  lcd.fillScreen(COLOR_BG);
+
+  lcd.fillRect(0, 0, 480, 30, COLOR_HEADER);
+  lcd.drawFastHLine(0, 30, 480, COLOR_LINE);
+  
+  lcd.fillRect(5, 3, 60, 24, COLOR_BTN_BG);
+  lcd.drawRect(5, 3, 60, 24, COLOR_LINE);
+  lcd.setTextDatum(MC_DATUM);
+  lcd.setTextSize(1);
+  lcd.setTextColor(COLOR_TEXT, COLOR_BTN_BG);
+  lcd.drawString("< BACK", 35, 15);
+
+  lcd.setTextDatum(TL_DATUM);
+  lcd.setTextSize(2);
+  lcd.setTextColor(COLOR_TEXT, COLOR_HEADER);
+  lcd.drawString("METROSURE", 75, 6);
+  lcd.endWrite();
+
+  drawUnitButtons();
+  drawTargetCard();
+  drawEncoderCard();
+  drawStockInfoCard();
+  drawActionButtons();
+}
+
+// ==========================================
+// --- Master Control Handling ---
+// ==========================================
+void handleMetroSureTouch(uint16_t x, uint16_t y) {
+  if (showing_finish_modal) {
+    if (x >= 160 && x <= 320 && y >= 195 && y <= 245) {
+      showing_finish_modal = false;
+      drawMetroSureDashboard();
+    }
+    return;
+  }
+
+  if (showing_keypad) {
+    handleKeypadTouch(x, y);
+    return;
+  }
+
+  if (x >= 5 && x <= 65 && y >= 3 && y <= 27) {
+    system_state = STATE_STOPPED;
+    current_view = VIEW_MATERIAL_DASHBOARD;
+    drawFullUI();
+    return;
+  }
+
+  if (y >= 35 && y <= 60 && x >= 300) {
+    if (x < 340)      current_unit = UNIT_MM;
+    else if (x < 380) current_unit = UNIT_CM;
+    else if (x < 420) current_unit = UNIT_M;
+    else              current_unit = UNIT_INCH;
+
+    drawUnitButtons();
+    drawTargetCard();
+    drawEncoderCard();
+    drawStockInfoCard();
+    return;
+  }
+
+  if (x >= 10 && x <= 470 && y >= 65 && y <= 125) {
+    showing_keypad = true;
+    keypad_input = "";
+    drawKeypad();
+    return;
+  }
+
+  if (y >= 240 && y <= 310) {
+    if (x >= 10 && x <= 155) {        
+      system_state = STATE_RUNNING;
+    } else if (x >= 167 && x <= 312) { 
+      system_state = STATE_PAUSED;
+    } else if (x >= 325 && x <= 470) { 
+      system_state = STATE_STOPPED;
+      encoder_pulse_count = 0;
+      raw_encoder_mm = 0.0f;
+      prev_drawn_encoder_mm = -1.0f;
+      drawEncoderCard();
+    }
+  }
+}
+
+void drawFullUI() {
+  switch (current_view) {
+    case VIEW_LOGIN:              drawLoginScreen(); break;
+    case VIEW_MATERIAL_DASHBOARD: drawMaterialDashboard(); break;
+    case VIEW_METROSURE:          drawMetroSureDashboard(); break;
+  }
+}
+
+void handleTouch(uint16_t x, uint16_t y) {
+  if (millis() - last_touch_time < TOUCH_DEBOUNCE_MS) return;
+  last_touch_time = millis();
+
+  switch (current_view) {
+    case VIEW_LOGIN:              handleLoginTouch(x, y); break;
+    case VIEW_MATERIAL_DASHBOARD: handleMaterialTouch(x, y); break;
+    case VIEW_METROSURE:          handleMetroSureTouch(x, y); break;
+  }
+}
+
+// ==========================================
+// --- Setup & Main Loop ---
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ENCODER_PIN_A, INPUT_PULLUP);
+  pinMode(ENCODER_PIN_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), readEncoderISR, RISING);
+
+  lcd.init();
+  lcd.setRotation(1);
+
+  drawFullUI();
+}
+
+void loop() {
+  uint16_t x, y;
+  if (lcd.getTouch(&x, &y)) {
+    handleTouch(x, y);
+  }
+
+  raw_encoder_mm = encoder_pulse_count * MM_PER_PULSE;
+  if (raw_encoder_mm < 0.0f) raw_encoder_mm = 0.0f;
+
+  if (current_view == VIEW_METROSURE && !showing_keypad && !showing_finish_modal) {
+    if (abs(raw_encoder_mm - prev_drawn_encoder_mm) >= 0.01f) {
+      prev_drawn_encoder_mm = raw_encoder_mm;
+      drawEncoderCard();
+    }
+  }
+
+  if (current_view == VIEW_METROSURE && system_state == STATE_RUNNING && raw_target_mm > 0.0f) {
+    if (raw_encoder_mm >= raw_target_mm && !showing_finish_modal) {
+      system_state = STATE_STOPPED;
+      piece_count++;
+
+      MaterialItem &mat = materials[selected_material_idx];
+      
+      if (mat.total_length_left_mm >= raw_target_mm) {
+        mat.total_length_left_mm -= raw_target_mm;
+      } else {
+        mat.total_length_left_mm = 0.0f;
+      }
+      
+      mat.total_length_cut_mm += raw_target_mm;
+
+      if (mat.std_bar_length_mm > 0) {
+        mat.total_bars_left = (uint32_t)(mat.total_length_left_mm / mat.std_bar_length_mm);
+      }
+
+      drawStockInfoCard();
+      drawFinishPopup();
+    }
+  }
+}
